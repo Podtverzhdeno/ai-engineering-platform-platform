@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>AI Platform — Workspace</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#2a3040;--txt:#dbe2ee;--dim:#8b96a8;--acc:#4f8cff;--ok:#2ecc71;--warn:#e67e22;--bad:#e74c3c}
+*{box-sizing:border-box;font-family:Segoe UI,system-ui,sans-serif}
+body{margin:0;background:var(--bg);color:var(--txt);font-size:14px}
+header{display:flex;gap:16px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;margin:0;color:var(--acc)}
+main{display:grid;grid-template-columns:1.35fr 1fr;gap:14px;padding:14px 18px;max-width:1500px;margin:0 auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+h2{font-size:14px;margin:0 0 10px;color:var(--acc);text-transform:uppercase;letter-spacing:.4px}
+label{display:block;margin:7px 0 3px;color:var(--dim);font-size:12px}
+input[type=text],textarea,select{width:100%;background:#0b0e13;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:7px 9px;font-size:13px}
+textarea{min-height:64px;resize:vertical;font-family:Consolas,monospace}
+button{margin:6px 6px 0 0;padding:7px 13px;border:0;border-radius:6px;background:var(--acc);color:#fff;font-size:13px;cursor:pointer}
+button.secondary{background:#243044}button.danger{background:var(--bad)}button.ok{background:var(--ok);color:#06210f}
+button:disabled{opacity:.4;cursor:not-allowed}
+.row{display:flex;gap:10px}.row>*{flex:1}
+.step{display:none}.step.on{display:block}
+.state{font-size:12px;color:var(--dim)}.tag{display:inline-block;padding:2px 8px;border-radius:10px;background:#243044;color:var(--acc);font-size:11px;margin-right:6px}
+pre.json{background:#0b0e13;border:1px solid var(--line);border-radius:6px;padding:8px;max-height:260px;overflow:auto;font-size:11px;white-space:pre-wrap}
+.msg{padding:7px 10px;border-radius:6px;margin-top:8px;font-size:12px}
+.err{background:#3a1518;color:#ff9aa3;border:1px solid #56232a}.info{background:#152a3a;color:#9fd0ff;border:1px solid #1f3c55}
+li{margin-bottom:4px}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:5px 7px;border-bottom:1px solid var(--line);text-align:left}
+.badge{font-size:10px;padding:1px 7px;border-radius:8px;background:#243044}
+.badge.OK{color:var(--ok)}.badge.HIGH,.badge.CRITICAL{color:#ff9aa3}
+</style>
+</head>
+<body>
+<header>
+  <h1>AI Platform Workspace</h1>
+  <span class="state">User ID:</span><input type="text" id="uid" style="width:190px" placeholder="usr-...">
+  <button class="secondary" onclick="saveUser()">Set user</button>
+  <button class="secondary" onclick="createUser()">Create user</button>
+  <input type="text" id="uname" style="width:120px;margin-left:6px" placeholder="имя">
+  <span class="state" id="who"></span>
+</header>
+<main>
+<div id="col-l">
+  <section>
+    <h2>1 · Проект</h2>
+    <div class="row"><div><label>Name</label><input type="text" id="p-name" value="demo-shop"></div>
+      <div><label>Mode</label><select id="p-mode"><option>NEW</option><option>CHANGE</option><option>BUGFIX</option><option>REFACTOR</option><option>MIGRATION</option><option>AUDIT</option><option>INCIDENT</option></select></div></div>
+    <button onclick="createProject()">Создать проект</button>
+    <button class="secondary" onclick="loadProject(document.getElementById('pid-in').value.trim())">Открыть ID</button>
+    <input type="text" id="pid-in" style="width:150px;margin-left:6px" placeholder="PRJ-...">
+    <div id="proj-head" style="margin-top:8px"></div>
+  </section>
+
+  <div id="s-interview" class="step"><section>
+    <h2>2 · Discovery Interview (§4)</h2>
+    <div id="round"></div>
+    <button onclick="submitAnswers()">Ответить на раунд</button>
+    <button class="secondary" onclick="finalizeInterview()">Финализировать (PRD + Approval Pack)</button>
+    <div id="itw-out"></div>
+  </section></div>
+
+  <div id="s-approve-product" class="step"><section>
+    <h2>3 · Product approval (CORE-01)</h2>
+    <div id="pack"></div>
+    <button class="ok" onclick="approve('product')">Approve product (owner)</button>
+  </section></div>
+
+  <div id="s-change" class="step"><section>
+    <h2>4 · Change Pack (OpenSpec §6)</h2>
+    <div class="row"><div><label>Title</label><input type="text" id="c-title" value="add order audit"></div>
+      <div><label>Affected paths (csv)</label><input type="text" id="c-paths" value="services/orders.py"></div></div>
+    <button onclick="createChange()">Создать change</button>
+    <label>Delta spec (OpenSpec ADDED/MODIFIED/REMOVED)</label>
+    <textarea id="c-delta">## ADDED Requirements
+
+### Requirement: Role Change Audit
+
+#### Scenario: Successful change
+</textarea>
+    <label class="row"><div>Design md</div><div>Threat model md (обязателен при HIGH/CRITICAL)</div><div>Test plan / operations</div></label>
+    <textarea id="c-design">C4-lite: orders service + audit writer контракт.</textarea>
+    <textarea id="c-threat">STRIDE: IDOR on role change → RBAC + audit hash.</textarea>
+    <textarea id="c-plan-docs">test-plan: unit+contract; operations: restore plan есть.</textarea>
+    <button onclick="submitDelta()">Submit delta → spec_hash</button>
+    <button onclick="submitDesign()">Submit design</button>
+    <button class="ok" onclick="approve('design')">Approve design (HIGH требует 2)</button>
+    <div id="change-out"></div>
+  </section></div>
+
+  <div id="s-plan" class="step"><section>
+    <h2>5 · Planning DAG (§10)</h2>
+    <label>Tasks JSON</label>
+    <textarea id="plan-json">
+[{"key":"T1","write_scope":["services/orders.py"],"acceptance_ids":["SC-1"]}]
+</textarea>
+    <button onclick="planChange()">Запланировать (конфликт scope → 422)</button>
+    <table id="tasks"></table>
+  </section></div>
+</div>
+
+<div id="col-r">
+  <section>
+    <h2>6 · Runs / Findings / Release</h2>
+    <div id="runs"></div>
+    <label>Finding: классификация · severity · file</label>
+    <div class="row"><div><input type="text" id="f-class" value="IDOR"></div><div><select id="f-sev"><option>LOW</option><option>MEDIUM</option><option selected>HIGH</option><option>CRITICAL</option></select></div><div><input type="text" id="f-file" value="services/orders.py"></div></div>
+    <label>Evidence URI (обязателен, §11.4)</label><input type="text" id="f-ev" value="artifact://run/finding.json">
+    <button onclick="addFinding()">Report finding</button>
+    <button class="secondary" onclick="bumpCycle()">Review cycle →</button>
+    <div id="findings"></div>
+    <label>Test results</label>
+    <button class="secondary" onclick="recordTest('unit')">record unit PASS</button>
+    <button class="secondary" onclick="recordTest('contract')">record contract PASS</button>
+    <div class="row">
+      <button class="ok" onclick="createRelease()">Create release</button>
+      <button onclick="mergeChange()">Merge (queue EPIC-15)</button>
+      <button onclick="deploy('staging')">Deploy staging</button>
+      <button class="danger" onclick="deploy('production')">Deploy production</button>
+      <button class="secondary" onclick="rollback()">Rollback</button>
+    </div>
+    <div id="release-out"></div>
+  </section>
+
+  <section>
+    <h2>7 · PSLC (§13)</h2>
+    <button class="secondary" onclick="createIncident()">Создать инцидент</button>
+    <button class="secondary" onclick="rcaIncident()">RCA → regression REQ</button>
+    <button class="secondary" onclick="dashboard()">Обновить дашборд</button>
+    <div id="pslc-out"></div>
+  </section>
+
+  <section>
+    <h2>Audit chain (tamper-evident)</h2>
+    <button class="secondary" onclick="audit()">Показать</button>
+    <div id="audit-out"></div>
+  </section>
+</div>
+</main>
+<script>
+const S = {uid: localStorage.getItem('uid')||'', pid: localStorage.getItem('pid')||'', itw:'', change:'', pack:null};
+document.getElementById('uid').value = S.uid;
+
+async function api(method, url, body){
+  const res = await fetch(url, {method, headers:{'X-User-Id': S.uid, 'Content-Type':'application/json'},
+    body: body===undefined?undefined:JSON.stringify(body)});
+  let j = null; try{ j = await res.json(); }catch{}
+  if(!res.ok) throw {status: res.status, body: j};
+  return j;
+}
+const el = (id)=>document.getElementById(id);
+function show(step){ document.querySelectorAll('.step').forEach(s=>s.classList.remove('on')); if(step) el(step).classList.add('on'); }
+function err(e){ return `<div class="msg err">${e.status||''} ${JSON.stringify(e.body&&e.body.detail||e.body||e)}</div>`; }
+function saveUser(){ S.uid = el('uid').value.trim(); localStorage.setItem('uid', S.uid); }
+async function createUser(){
+  try{ const r = await api('POST', '/v1/users', {name: el('uname').value || 'user-' + Date.now()});
+    S.uid = r.id; el('uid').value = r.id; localStorage.setItem('uid', r.id);
+    renderUsers();
+  }catch(e){ el('who').textContent = err(e); }
+}
+
+async function createProject(){
+  try{
+    const p = await api('POST','/v1/projects',{name: el('p-name').value||'proj', mode: el('p-mode').value});
+    S.pid = p.id; localStorage.setItem('pid', p.id);
+    document.getElementById('pid-in').value = p.id;
+    S.itw=''; S.change='';
+    await renderUsers(); await loadProject(p.id);
+  }catch(e){ el('proj-head').innerHTML = err(e); }
+}
+async function renderUsers(){
+  el('who').textContent = `(${S.uid.slice(0,10)}...) pid=${S.pid}`;
+}
+async function loadProject(pid){
+  S.pid = pid; localStorage.setItem('pid', pid);
+  try{
+    const p = await api('GET', `/v1/projects/${pid}`);
+    el('proj-head').innerHTML = `<span class="tag">${p.id}</span> state=<b>${p.state}</b> spec_v=${p.spec_version} cls=${p.classification}${S.itw?` · interview=${S.itw}`:''}${S.change?` · change=${S.change}`:''}`;
+    route(p.state);
+  }catch(e){ el('proj-head').innerHTML = err(e); show(null); }
+}
+function route(state){
+  const map = {'CREATED':null,'INTERVIEW_IN_PROGRESS':'s-interview','PRODUCT_PROPOSED':'s-approve-product',
+    'PRODUCT_APPROVED':'s-change','DESIGNING':'s-change','DESIGN_APPROVED':'s-plan',
+    'IMPLEMENTATION_ALLOWED':'s-plan','REVIEW_READY':'s-plan','RELEASE_CANDIDATE':'s-plan','DEPLOYED':'s-plan'};
+  show(state in map ? map[state] : null);
+  if(state==='INTERVIEW_IN_PROGRESS') refreshRound();
+  refreshSide();
+}
+async function startInterview(){
+  try{ const r = await api('POST','/v1/interviews',{project_id:S.pid}); S.itw = r.interview_id; await loadProject(S.pid); }
+  catch(e){ el('proj-head').innerHTML = err(e); }
+}
+async function refreshRound(){
+  if(!S.itw){
+    try{ const r = await api('POST','/v1/interviews',{project_id:S.pid}); S.itw=r.interview_id; }
+    catch(e){
+      try{ const list = await api('GET', `/v1/projects/${S.pid}/interviews`); S.itw = list.length? list[list.length-1].id : ''; }
+      catch(e2){}
+    }
+  }
+  let d; try{ d = await api('GET', `/v1/interviews/${S.itw}`); }catch(e){ el('round').innerHTML = err(e); return; }
+  el('round').innerHTML = `<div class="state">interview ${S.itw} · Round: ${d.round.length} вопросов · gaps: ${d.gaps.length}</div>` +
+    d.round.map(q=>`<div><label>${q.id} · ${q.area} · p${q.priority}</label><textarea id="a-${q.id}"></textarea></div>`).join('');
+}
+async function submitAnswers(){
+  const t = await textareas('#round textarea[id^=a-]');
+  try{
+    const r = await api('POST', `/v1/interviews/${S.itw}/answers`, {answers: t});
+    el('itw-out').innerHTML = `<div class="msg info"> записано ${r.recorded}; далее раунд: ${r.round.length}, gaps: ${r.gaps.length}</div>`;
+    if(!r.round.length && !r.gaps.length) el('itw-out').innerHTML += `<div class="msg info">Все критические вопросы закрыты — можно финализировать.</div>`;
+    refreshRound();
+  }catch(e){ el('itw-out').innerHTML = err(e); }
+}
+async function textareas(sel){ return [...document.querySelectorAll(sel)].map(t=>({question_id:t.id.slice(2), answer: t.value.trim()||'ok'})); }
+async function finalizeInterview(){
+  try{
+    const r = await api('POST', `/v1/interviews/${S.itw}/finalize`);
+    S.pack = r.approval_pack;
+    el('pack').innerHTML = `<pre class="json">${JSON.stringify(S.pack, null, 1)}</pre>`;
+    show('s-approve-product');
+  }catch(e){ el('itw-out').innerHTML = err(e); }
+}
+async function approve(purpose, changeId){
+  try{
+    const body = {project_id: S.pid, purpose};
+    if(changeId) body.change_id = changeId;
+    const r = await api('POST','/v1/approvals', body);
+    await loadProject(S.pid);
+    if(S.change) changeOut(`<div class="msg info">approval: change_state=${r.change_state}, project=${r.project_state}</div>`);
+  }catch(e){ (S.change?changeOut:(x)=>{el('pack').innerHTML=x})(err(e)); }
+}
+function changeOut(html){ el('change-out').innerHTML += html; }
+async function createChange(){
+  const S_ = S;
+  try{
+    const r = await api('POST','/v1/changes',{project_id:S.pid, title: el('c-title').value,
+      affected_paths: el('c-paths').value.split(',').map(s=>s.trim()).filter(Boolean)});
+    S.change = r.id;
+    await loadProject(S.pid);
+  }catch(e){ el('change-out').innerHTML = err(e); }
+}
+async function submitDelta(){
+  try{
+    const r = await api('POST', `/v1/changes/${S.change}/delta`, {delta_md: el('c-delta').value});
+    changeOut(`<div class="msg info">spec_hash=${r.spec_hash.slice(0,22)}... (изменение дельты → новый hash)</div>`);
+  }catch(e){ el('change-out').innerHTML = err(e); }
+}
+async function submitDesign(){
+  try{
+    const r = await api('POST', `/v1/changes/${S.change}/design`, {design_md: el('c-design').value,
+      threat_model_md: el('c-threat').value, test_plan_md: el('c-plan-docs').value, operations_md: el('c-plan-docs').value});
+    changeOut(`<div class="msg info">design: state=${r.state}, risk=${JSON.stringify(r.risk)}</div>`);
+    await loadProject(S.pid);
+  }catch(e){ el('change-out').innerHTML = err(e); }
+}
+async function planChange(){
+  let tasks; try{ tasks = JSON.parse(el('plan-json').value); }catch(e){ el('tasks').innerHTML = `<tr><td>JSON невалиден</td></tr>`; return; }
+  try{
+    const r = await api('POST', `/v1/changes/${S.change}/plan`, {tasks});
+    renderTasks();
+  }catch(e){ el('tasks').innerHTML = `<tr><td>${err(e)}</td></tr>`; }
+}
+async function renderTasks(){
+  try{
+    const ts = await api('GET', `/v1/changes/${S.change}/tasks`);
+    el('tasks').innerHTML = `<tr><th>task</th><th>status</th><th>scope</th><th></th></tr>` +
+      ts.map(t=>`<tr><td>${t.title}</td><td><span class="badge ${t.status}">${t.status}</span></td><td>${t.write_scope.join(', ')}</td>
+      <td>${t.status==='READY'?`<button onclick="runTask('${t.title}')">Run (sandbox)</button>`:''}</td></tr>`).join('');
+  }catch(e){ /* change not planned yet */ }
+}
+async function runTask(key){
+  try{
+    const r = await api('POST', `/v1/changes/${S.change}/tasks/${key}/run`);
+    let out; try{ out = await api('POST', `/v1/runs/${r.run_id}/finish`, {commit_sha: '5f1a3b9c7d2e4f6081a2b3c4d5e6f7089abcdef01', test_result:'PASS', diff_summary:'simulated session', open_questions:['Реальная сессия: AIPLATFORM_OPENCODE_LIVE=1 + opencode serve']}); }
+    catch(e){ el('runs').innerHTML = err(e); return; }
+    el('runs').innerHTML = `<div class="msg info">run=${out.run} task=${out.task_id} commit=${out.status} (simulated) </div>`;
+    renderTasks();
+  }catch(e){ el('runs').innerHTML = err(e); }
+}
+async function addFinding(){
+  try{
+    const r = await api('POST', `/v1/changes/${S.change}/findings`, {classification: el('f-class').value,
+      severity: el('f-sev').value, file: el('f-file').value, evidence_uri: el('f-ev').value});
+    findingsOut(`<div class="msg info">finding ${r.id} — verifier: 
+      <button class="secondary" onclick="verify('${r.id}','CONFIRMED')">CONFIRM</button>
+      <button class="secondary" onclick="verify('${r.id}','REJECTED')">REJECT</button>
+      <button class="secondary" onclick="verify('${r.id}','INCONCLUSIVE')">INCONCL</button></div>`);
+  }catch(e){ el('findings').innerHTML = err(e); }
+}
+function findingsOut(h){ el('findings').innerHTML += h; }
+async function bumpCycle(){ try{ await api('POST', `/v1/changes/${S.change}/review-cycle`); findingsOut(`<div class="msg info">cycle++</div>`);}catch(e){ el('findings').innerHTML += err(e) + `<div class="msg err">3 раунда без конвергенции — root-cause обязателен</div>`; } }
+async function verify(fId, verdict){ try{ await api('POST', `/v1/findings/${fId}/verify`, {verdict, reproduction:'pytest::repro-x'}); findingsOut(`<div class="msg info">${fId} → ${verdict}</div>`);}catch(e){ el('findings').innerHTML += err(e); } }
+async function recordTest(suite){ try{ await api('POST', `/v1/changes/${S.change}/test-results`, {suite, status:'PASS'}); findingsOut(`<div class="msg info">${suite} PASS записан</div>`);}catch(e){ el('findings').innerHTML += err(e); } }
+async function createRelease(){ try{ const r = await api('POST', `/v1/changes/${S.change}/releases`, {}); el('release-out').innerHTML = `<div class="msg info">release ${r.id} state=${r.state} risk=${r.risk}</div>`;}catch(e){ el('release-out').innerHTML = err(e); } }
+async function mergeChange(){ try{ const r = await api('POST', `/v1/changes/${S.change}/merge`); el('release-out').innerHTML = `<div class="msg info">${JSON.stringify(r)}</div>`;}catch(e){ el('release-out').innerHTML = err(e); } }
+
+async function deploy(env){
+  const match = el('release-out').textContent.match(/release (REL-[a-zA-Z0-9]+)/)||el('release-out').innerHTML.match(/REL-[a-zA-Z0-9]+/);
+  const rel = match && match[0];
+  if(!rel){ el('release-out').innerHTML = `<div class="msg err">сначала create release</div>`; return; }
+  try{ const r = await api('POST', `/v1/releases/${rel}/deploy`, {environment: env});
+    el('release-out').innerHTML = `<div class="msg info">${env}: state=${r.state}</div>`; }
+  catch(e){ el('release-out').innerHTML = err(e) + (env==='production'?`<div class="msg err">§12.1: локальный профиль запрещает production без 2 approvals</div>`:''); }
+}
+async function rollback(){
+  const match = el('release-out').textContent.match(/REL-[a-zA-Z0-9]+/)||[];
+  const rel = match[0]|| (el('release-out').innerHTML.match(/REL-[a-zA-Z0-9]+/)||[])[0];
+  try{ const r = await api('POST', `/v1/releases/${rel}/rollback`); el('release-out').innerHTML = `<div class="msg info">rollback → ${r.state}</div>`;}catch(e){ el('release-out').innerHTML = err(e); }
+}
+async function createIncident(){ try{ const r = await api('POST','/v1/incidents',{project_id:S.pid, impact:'demo impact'}); S.inc=r.id; el('pslc-out').innerHTML = `<div class="msg info">incident ${r.id}</div>`;}catch(e){ el('pslc-out').innerHTML = err(e); } }
+async function rcaIncident(){ if(!S.inc){el('pslc-out').innerHTML=`<div class="msg err">нет инцидента</div>`;return;}
+  try{ const r = await api('POST', `/v1/incidents/${S.inc}/rca`, {rca:'demo root cause', regression_case:{scenario:'regression-scenario'}});
+    el('pslc-out').innerHTML = `<div class="msg info">RCA зафиксирована, regression=${r.regression_requirement}</div>`;}catch(e){ el('pslc-out').innerHTML = err(e); } }
+async function dashboard(){ try{ const d = await api('GET', `/v1/pslc-dashboard/${S.pid}`);
+    el('pslc-out').innerHTML = `<table><tr><th>releases</th><th>incidents</th><th>open findings</th><th>policy denials</th><th>budget/spent</th></tr>
+    <tr><td>${d.releases}</td><td>${d.incidents}</td><td>${d.confirmed_open_findings}</td><td>${d.policy_denials}</td><td>${d.spent_usd}/${d.budget_usd}</td></tr></table>`;}catch(e){ el('pslc-out').innerHTML = err(e); } }
+async function audit(){ try{ const a = await api('GET', `/v1/projects/${S.pid}/audit`);
+    const cls = a.chain_ok ? '<span class="badge OK">chain OK</span>' : `<span class="badge HIGH">TAMPERED @${a.broken_event_id}</span>`;
+    el('audit-out').innerHTML = `${cls}` + `<table>` + a.events.map(e=>`<tr><td>${e.id}</td><td>${e.action}</td><td>${e.actor}</td><td>${e.ts}</td></tr>`).join('') + `</table>`;}catch(e){ el('audit-out').innerHTML = err(e); } }
+async function refreshSide(){ if(S.change){ renderTasks(); dashboard(); } }
+async function afterInterviewStart(){ el('round').innerHTML=''; await refreshRound(); }
+document.querySelectorAll('input,textarea').forEach(t=>t.addEventListener('keydown', e=>{ if(e.key==='Enter'&&!e.shiftKey&&t.type!=='textarea') e.preventDefault(); }));
+
+async function bootUser(){ if(S.uid){ await renderUsers(); } }
+window.startInterview = startInterview; window.afterInterviewStart = afterInterviewStart;
+</script>
+</body>
+</html>

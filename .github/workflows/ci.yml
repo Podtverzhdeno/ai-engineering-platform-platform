@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install platform + dev deps
+        run: |
+          pip install -e ".[dev]"
+          pip install hatch
+
+      - name: Acceptance tests
+        run: pytest -q
+
+      - name: CLI smoke (aip serve + create-user)
+        run: |
+          aip serve --port 7731 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:7731/healthz >/dev/null && break || sleep 1; done
+          curl -sf http://127.0.0.1:7731/healthz
+          curl -sf -X POST http://127.0.0.1:7731/v1/users -H 'Content-Type: application/json' -d '{"name":"ci"}' | grep -o '"id"'
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app image
+        run: docker build -f infra/app.Dockerfile -t aip-app:ci .
+
+      - name: Build runner image
+        run: docker build infra/runner -t aip-runner:ci
+
+      - name: Compose config sanity
+        run: docker compose -f infra/docker-compose.yml config -q

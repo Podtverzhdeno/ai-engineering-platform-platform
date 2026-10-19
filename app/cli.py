@@ -159,6 +159,12 @@ def cmd_demo(args: argparse.Namespace) -> None:  # noqa: C901 — линейны
 
 
 def main(argv: list[str] | None = None) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and getattr(stream, "encoding", "").lower() != "utf-8":
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     parser = argparse.ArgumentParser(prog="aip", description="AI Engineering Platform CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

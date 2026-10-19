@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -37,6 +38,9 @@ class BudgetIn(BaseModel):
 
 @router.post("/v1/users", status_code=201)
 def create_user(payload: UserIn, db: Session = Depends(get_db)) -> dict:
+    existing = db.query(User).filter(User.name == payload.name).first()
+    if existing is not None:
+        return JSONResponse(status_code=200, content={"id": existing.id, "name": existing.name})
     user = User(id=new_id("usr"), name=payload.name)
     db.add(user)
     db.commit()

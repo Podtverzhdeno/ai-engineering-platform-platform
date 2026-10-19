@@ -175,6 +175,17 @@ def main(argv: list[str] | None = None) -> None:
     d = sub.add_parser("demo", help="прогнать демо-поток против запущенного сервера")
     d.set_defaults(fn=cmd_demo)
 
+    c = sub.add_parser("chat", help="разговорный агент: 'aip chat' и пиши по-русски, что сделать")
+    c.add_argument("--url", default=os.environ.get("AIPLATFORM_URL", DEFAULT_URL))
+
+    def cmd_chat(args: argparse.Namespace) -> None:
+        os.environ["AIPLATFORM_URL"] = args.url
+        from app import agent
+
+        raise SystemExit(agent.repl())
+
+    c.set_defaults(fn=cmd_chat)
+
     unknown_parser = parser.parse_args(argv)
     if getattr(unknown_parser, "db", None):
         os.environ["AIPLATFORM_DB_URL"] = "sqlite:///" + os.path.abspath(unknown_parser.db).replace("\\", "/")

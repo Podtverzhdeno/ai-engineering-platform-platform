@@ -135,3 +135,4 @@ POST /v1/incidents + /rca                            регресс-тест ф�
 ## Runbook'ы
 
 `docs/runbooks/{provider-outage,runner-crash,data-leak-suspicion}.md`; `docs/NOTICE.md` — лицензии; `docs/benchmark-plan.md` — испытания.
+

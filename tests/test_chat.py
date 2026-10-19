@@ -9,6 +9,8 @@ from app.main import app
 @pytest.fixture()
 def agent_api(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_mod, "SESSION_FILE", str(tmp_path / "sess.json"))
+    monkeypatch.setattr(agent_mod, "provider_variants", lambda: {})
+    monkeypatch.setenv("AIPLATFORM_CHAT_BRAIN", "off")
     return Api(base="http://testserver", client=TestClient(app))
 
 
@@ -22,27 +24,29 @@ def test_power_preset_roundtrip(agent_api):
 
 
 def test_llm_brain_intent_used(agent_api, monkeypatch):
+    monkeypatch.setenv("AIPLATFORM_CHAT_BRAIN", "on")
     calls = []
 
-    def fake_llm(provider_id, model_id, text):
+    def fake_llm(provider_id, model_id, text, variant="", session_id=""):
         calls.append((provider_id, model_id))
-        return '{"intent":"analytics","name":"","title":"","task":"","reply":""}'
+        if "привет" in text:
+            return '{"intent":"chat","reply":"Привет! Готов всё собрать."}', "ses_2"
+        return '{"intent":"user","name":"vasya","title":"","task":"","reply":""}', "ses_1"
 
     monkeypatch.setattr(agent_mod, "llm_call", fake_llm)
     s = Session()
-    assert s.power == "max" and s.model_label() == "anthropic/claude-opus-4-5"
-    handle(s, agent_api, "создай пользователя vasya")
-    monkeypatch.setattr(
-        agent_mod, "llm_call", lambda *a, **k: '{"intent":"chat","reply":"Привет! Готов всё собрать."}'
-    )
+    assert s.power == "max"
+    out = handle(s, agent_api, "создай пользователя vasya")
+    assert any("usr-" in x for x in out)
     out = handle(s, agent_api, "привет, как дела")
     assert any("Привет!" in x for x in out)
-    assert calls == [("anthropic", "claude-opus-4-5")]
-
+    assert calls and calls[0][0] == "anthropic" and calls[0][1] == "claude-opus-4-5"
 
 def test_llm_broken_falls_back_to_parser(agent_api, monkeypatch):
+    monkeypatch.setenv("AIPLATFORM_CHAT_BRAIN", "on")
+
     def broken(*a, **k):
-        raise RuntimeError("model error: invalid x-api-key")
+        raise RuntimeError("invalid x-api-key")
 
     monkeypatch.setattr(agent_mod, "llm_call", broken)
     s = Session()
@@ -51,6 +55,15 @@ def test_llm_broken_falls_back_to_parser(agent_api, monkeypatch):
     assert s.llm_broken is True
     out = handle(s, agent_api, "создай проект orders")
     assert any("product approval" in x for x in out)
+
+
+def test_free_provider_choice(agent_api, monkeypatch):
+    monkeypatch.setattr(agent_mod, "provider_variants", lambda: {})
+    s = Session()
+    out = handle(s, agent_api, "провайдер opencode")
+    assert any("провайдер opencode" in x and "glm-5.3-flash-free" in x for x in out)
+    out = handle(s, agent_api, "мышление low")
+    assert any("glm-5.3-flash-free, размышление: low" in x for x in out)
 
 
 def _reply(api, user, path, body=None):

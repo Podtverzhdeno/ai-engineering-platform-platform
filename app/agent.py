@@ -22,12 +22,16 @@ DEFAULT_URL = os.environ.get("AIPLATFORM_URL", "http://127.0.0.1:7700")
 SESSION_FILE = os.path.join(os.getcwd(), ".aip-session.json")
 OPENCODE_URL = os.environ.get("AIPLATFORM_OPENCODE_URL", "http://127.0.0.1:4096")
 
-MODEL_PRESETS: dict[str, tuple[str, str]] = {
-    "low": ("opencode", "glm-5.3-flash-free"),
-    "medium": ("anthropic", "claude-haiku-4-5"),
-    "high": ("anthropic", "claude-sonnet-4-5"),
-    "max": ("anthropic", "claude-opus-4-5"),
+DEFAULT_PROVIDER_MODEL = ("opencode", "glm-5.3-flash-free", "high")
+
+MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
+    "low": ("opencode", "glm-5.3-flash-free", "low"),
+    "medium": ("anthropic", "claude-haiku-4-5", "medium"),
+    "high": ("anthropic", "claude-sonnet-4-5", "high"),
+    "max": ("anthropic", "claude-opus-4-5", "high"),
 }
+
+VARIANT_ORDER = ("low", "medium", "high", "xhigh", "max")
 
 LLM_DIRECTIVE = (
     "Ты мозг CLI-агента платформы. Отвечай ОДНОЙ строкой строгого JSON без markdown:\n"
@@ -36,6 +40,8 @@ LLM_DIRECTIVE = (
     "Поле reply — только для intent=chat: твой живой русский ответ пользователю.\n"
     "правила: empty поля — empty строки; не добавляй ничего кроме JSON."
 )
+
+_VARIANTS_CACHE: dict[str, dict[str, list[str]]] | None = None
 
 
 def _oc_request(method: str, path: str, body: dict | None = None, timeout: float = 240.0) -> dict:
@@ -49,24 +55,65 @@ def _oc_request(method: str, path: str, body: dict | None = None, timeout: float
     return r.json()
 
 
-def llm_call(provider_id: str, model_id: str, text: str) -> str:
-    data = _oc_request("POST", "/session", {"title": "aip-chat"})
-    sid = data["id"]
-    msg = _oc_request(
-        "POST",
-        f"/session/{sid}/message",
-        {"modelID": model_id, "providerID": provider_id, "parts": [{"type": "text", "text": text}]},
-    )
+def provider_variants() -> dict[str, dict[str, list[str]]]:
+    global _VARIANTS_CACHE
+    if _VARIANTS_CACHE is None:
+        try:
+            data = _oc_request("GET", "/config/providers", timeout=20)
+            out: dict[str, dict[str, list[str]]] = {}
+            for prov in data.get("providers") or []:
+                pid = prov.get("id") or ""
+                if not pid:
+                    continue
+                out[pid] = {
+                    mid: list((md or {}).get("variants") or {})
+                    for mid, md in (prov.get("models") or {}).items()
+                }
+            _VARIANTS_CACHE = out
+        except (httpx.HTTPError, RuntimeError, KeyError):
+            _VARIANTS_CACHE = {}
+    return _VARIANTS_CACHE
+
+
+def clamp_variant(provider_id: str, model_id: str, wanted: str) -> str:
+    variants = provider_variants().get(provider_id, {}).get(model_id) or []
+    if not variants:
+        return wanted if wanted else ""
+    if wanted in variants:
+        return wanted
+    wi = VARIANT_ORDER.index(wanted) if wanted in VARIANT_ORDER else len(VARIANT_ORDER) - 1
+    best, bd = variants[0], 10**9
+    for v in variants:
+        vi = VARIANT_ORDER.index(v) if v in VARIANT_ORDER else 0
+        d = abs(vi - wi)
+        if d < bd:
+            best, bd = v, d
+    return best
+
+
+def llm_call(
+    provider_id: str, model_id: str, text: str, variant: str = "", session_id: str = ""
+) -> tuple[str, str]:
+    sid = session_id
+    if not sid:
+        sid = _oc_request("POST", "/session", {"title": "aip-chat"})["id"]
+    body: dict = {
+        "model": {"providerID": provider_id, "modelID": model_id},
+        "parts": [{"type": "text", "text": text}],
+    }
+    if variant:
+        body["model"]["variant"] = variant
+    msg = _oc_request("POST", f"/session/{sid}/message", body)
     info = (msg or {}).get("info") or {}
     err = info.get("error")
     if err:
-        raise RuntimeError(f"model error: {str(err.get('data', {}).get('message', err))[:120]}")
+        raise RuntimeError(str((err.get("data") or {}).get("message", err))[:140])
     texts = [
         p.get("text", "")
         for p in (msg.get("parts") or [])
         if isinstance(p, dict) and p.get("type") == "text"
     ]
-    return "\n".join(t for t in texts if t).strip()
+    return "\n".join(t for t in texts if t).strip(), sid
 
 
 def _typical_answer(project_name: str) -> str:
@@ -106,6 +153,8 @@ class Session:
         self.pending: dict | None = None
         self.power: str = "max"
         self.model: str = ""
+        self.variant: str = ""
+        self.oc_sid: str = ""
         self.llm_broken: bool = False
 
     def save(self) -> None:
@@ -120,6 +169,7 @@ class Session:
                         "current_change": self.current_change,
                         "power": self.power,
                         "model": self.model,
+                        "variant": self.variant,
                         "llm_broken": self.llm_broken,
                     },
                     fh,
@@ -141,16 +191,20 @@ class Session:
             s.current_change = data.get("current_change", "")
             s.power = data.get("power", "max")
             s.model = data.get("model", "")
+            s.variant = data.get("variant", "")
             s.llm_broken = bool(data.get("llm_broken"))
         except (OSError, ValueError):
             pass
         return s
 
     def model_label(self) -> str:
+        provider, model, _ = MODEL_PRESETS["max"]
         if self.model:
-            return self.model
-        provider, model = MODEL_PRESETS.get(self.power, MODEL_PRESETS["max"])
-        return f"{provider}/{model}"
+            provider, model = (self.model.split("/", 1) + [""])[:2] if "/" in self.model else (self.model, "")
+        else:
+            provider, model, _v = MODEL_PRESETS.get(self.power, MODEL_PRESETS["max"])
+        var = f" ({self.variant})" if self.variant else ""
+        return f"{provider}/{model}{var}"
 
 
 def _ok(msg: str) -> str:
@@ -378,6 +432,12 @@ HELP = [
     "  'мёрж'                           — test-results + readiness + merge",
     "  'статус' / 'аналитика' / 'память'",
     "  'демо'                           — полный эталонный сценарий",
+    "Модель мозга:",
+    "  'мощность [low|medium|high|max]' — пресет (по умолчанию max)",
+    "  'провайдер [opencode|anthropic|…]' — выбор провайдера (opencode — бесплатно, без ключей)",
+    "  'модель provider/имя'            — точная модель (например opencode/glm-5.3-flash-free)",
+    "  'мышление [low|medium|high|xhigh|max]' — глубина размышления",
+    "  нет ключа — автоматически используется свободная модель opencode",
     "  'выход'",
 ]
 
@@ -437,67 +497,156 @@ def parse(text: str) -> dict:
 INTENT_KEYS = ("user", "project", "change", "run", "merge", "status", "analytics", "demo", "help", "chat")
 
 
-def smart_intent(session: Session, text: str) -> dict | None:
-    """LLM-компас: превращает свободную фразу в {intent, ...}.
-
-    При недоступности/ошибке модели возвращает None и сеанс переключается
-    на встроенный детерминированный парсер.
-    """
-    if session.llm_broken:
-        return None
+def _session_candidates(session: "Session") -> list[tuple[str, str, str, bool]]:
+    """Цепочка попыток: что выбран юзером → что по мощности → свободная модель."""
+    out: list[tuple[str, str, str, bool]] = []
     if session.model and "/" in session.model:
         provider_id, model_id = session.model.split("/", 1)
-    else:
-        provider_id, model_id = MODEL_PRESETS.get(session.power, MODEL_PRESETS["max"])
-    try:
-        raw = llm_call(provider_id, model_id, f"{LLM_DIRECTIVE}\n\nПользователь написал: {text}")
-    except Exception:
-        session.llm_broken = True
-        session.save()
-        return None
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
-        session.llm_broken = True
-        session.save()
-        return None
-    try:
-        data = json.loads(raw[start : end + 1])
-    except ValueError:
-        session.llm_broken = True
-        session.save()
-        return None
-    if not isinstance(data, dict) or data.get("intent") not in INTENT_KEYS:
-        session.llm_broken = True
-        session.save()
-        return None
-    return data
+        out.append((provider_id, model_id, session.variant or "", True))
+    power = session.power if session.power in MODEL_PRESETS else "max"
+    p, m, v = MODEL_PRESETS[power]
+    variant = clamp_variant(p, m, v)
+    if (p, m) not in [(c[0], c[1]) for c in out]:
+        out.append((p, m, variant, True))
+    fp, fm, fv = DEFAULT_PROVIDER_MODEL
+    if (fp, fm) not in [(c[0], c[1]) for c in out]:
+        out.append((fp, fm, clamp_variant(fp, fm, power == "low" and "low" or (power == "max" and "max" or "high")), False))
+    return out
 
 
-def set_power(session: Session, token: str) -> list[str]:
+def smart_intent(session: "Session", text: str) -> tuple["dict | None", list[str]]:
+    """LLM-компас: превращает свободную фразу в {intent, ...}.
+
+    Пытает выбранный провайдер/модель; при недоступности ключа каскадом
+    падает до свободных моделей opencode. Полный провал → None и
+    встроенный детерминированный парсер. AIPLATFORM_CHAT_BRAIN=off —
+    детерминированный режим без LLM-попыток.
+    """
+    if session.llm_broken or os.environ.get("AIPLATFORM_CHAT_BRAIN", "").lower() == "off":
+        return None, []
+    notes: list[str] = []
+    last_err: str = ""
+    for provider_id, model_id, variant, explicit in _session_candidates(session):
+        try:
+            raw, sid = llm_call(
+                provider_id,
+                model_id,
+                f"{LLM_DIRECTIVE}\n\nПользователь написал: {text}",
+                variant=variant or "",
+                session_id=session.oc_sid,
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            last_err = str(exc)[:140]
+            continue
+        session.oc_sid = sid
+        if not explicit or not session.model:
+            session.model = f"{provider_id}/{model_id}"
+            session.variant = variant
+        notes.append(f"(мозг: {provider_id}/{model_id}" + (f", размышление {variant}" if variant else "") + ")")
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None, notes + ["(LLM ответил не по формату — встроенный парсер)"]
+        try:
+            data = json.loads(raw[start : end + 1])
+        except ValueError:
+            return None, notes + ["(LLM ответил не по формату — встроенный парсер)"]
+        if not isinstance(data, dict) or data.get("intent") not in INTENT_KEYS:
+            return None, notes + ["(LLM ответил не по формату — встроенный парсер)"]
+        session.save()
+        return data, notes
+    if not session.llm_broken:
+        session.llm_broken = True
+        session.save()
+    notes.append(f"(LLM недоступен: {last_err}; встроенный парсер)")
+    return None, notes
+
+
+def set_power(session: "Session", token: str) -> list[str]:
     token = token.strip().lower()
     if not token:
-        return [f"Сейчас: {session.power} (= {session.model_label()})", "Варианты: низкая | средняя | высокая | максимальная | режим provider/model"]
-    low = token[0]
+        return [
+            f"Сейчас: мощность {session.power} → {session.model_label()}",
+            "Варианты: low  medium  high  max",
+            "Точно провайдер: 'provider opencode' / 'provider anthropic'; модель: 'model provider/имя'; глубину размышления: 'thinking low..max'",
+        ]
+    low = token[:1]
     aliases = {
         "л": "low", "с": "medium", "в": "high", "м": "max",
         "low": "low", "medium": "medium", "high": "high", "max": "max",
+        "малый": "low", "малое": "low", "средний": "medium", "средняя": "medium",
+        "высокий": "high", "высокая": "high", "высокое": "high",
+        "макс": "max", "максимум": "max", "максимальный": "max",
     }
-    if token in aliases:
-        session.power = aliases[token]
-        session.model = ""
-        session.save()
-        return [_ok(f"мощность: {session.power} (= {session.model_label()})")]
-    if low in aliases:
-        session.power = aliases[low]
-        session.model = ""
-        session.save()
-        return [_ok(f"мощность: {session.power} (= {session.model_label()})")]
+    resolved = aliases.get(token) or aliases.get(low)
     if "/" in token:
-            session.model = token
-            session.save()
-            return [_ok(f"модель: {session.model}")]
-    return ["Не понял мощность. Варианты: низкая/средняя/высокая/максимальная или provider/model"]
+        session.model = token
+        session.variant = ""
+        session.llm_broken = False
+        session.save()
+        return [_ok(f"модель: {session.model}")]
+    if not resolved:
+        return ["Не понял мощность; варианты: low medium high max — или 'provider opencode'"]
+    session.power = resolved
+    session.model = ""
+    session.variant = ""
+    session.llm_broken = False
+    session.oc_sid = ""
+    session.save()
+    return [_ok(f"мощность: {session.power} → {session.model_label()}")]
+
+
+def set_provider(session: "Session", token: str) -> list[str]:
+    token = token.strip().lower()
+    if "/" in token:
+        return set_power(session, token)
+    if not token:
+        head = session.model.split("/", 1)
+        current = head[0] if len(head) == 2 and head[0] else MODEL_PRESETS.get(session.power, MODEL_PRESETS["max"])[0]
+        known = provider_variants() or {current: {}}
+        return [
+            f"Сейчас провайдер: {current}. Известные: {', '.join(sorted(known))}",
+            "Выбор: 'provider opencode' (бесплатно, без ключей) или 'provider anthropic' (по ключу)",
+        ]
+    known: dict = provider_variants()
+    models = known.get(token)
+    if models is None and token in ("opencode", "anthropic", "openrouter", "cloudflare"):
+        models = {}
+    if models is None:
+        return [f"Не знаю провайдера '{token}'. Известные: " + ", ".join(sorted(known or ["opencode"]))]
+    default_model = "glm-5.3-flash-free" if token == "opencode" else (sorted(models)[0] if models else "")
+    if token == "anthropic" and "claude-opus-4-5" in models:
+        default_model = "claude-opus-4-5"
+    session.model = f"{token}/{default_model}" if default_model else ""
+    session.variant = ""
+    session.llm_broken = False
+    session.oc_sid = ""
+    session.save()
+    return [
+        _ok(f"провайдер {token}" + (f"; модель {default_model}" if default_model else " — задай модель: 'model provider/имя'"))
+    ]
+
+
+def set_variant(session: "Session", token: str) -> list[str]:
+    token = token.strip().lower()
+    aliases = {
+        "л": "low", "с": "medium", "в": "high", "м": "max",
+        "low": "low", "малый": "low", "малое": "low", "минимум": "low",
+        "medium": "medium", "средний": "medium", "среднее": "medium", "средняя": "medium",
+        "high": "high", "высокий": "high", "высокое": "high", "высокая": "high",
+        "xhigh": "xhigh", "сверхвысокое": "xhigh",
+        "max": "max", "макс": "max", "максимум": "max", "максимальный": "max",
+    }
+    wanted = aliases.get(token) or aliases.get(token[:1]) if token else None
+    if not wanted:
+        return ["Глубина размышления: low medium high xhigh max"]
+    provider_id, model_id = (
+        session.model.split("/", 1) if "/" in session.model else MODEL_PRESETS.get(session.power, MODEL_PRESETS["max"])[:2]
+    )
+    session.variant = clamp_variant(provider_id, model_id, wanted)
+    session.llm_broken = False
+    session.save()
+    return [_ok(f"{provider_id}/{model_id}, размышление: {session.variant or '(по умолчанию)'}")]
 
 
 def handle(session: Session, api: Api, text: str) -> list[str]:
@@ -508,47 +657,60 @@ def handle(session: Session, api: Api, text: str) -> list[str]:
     if low in ("выход", "exit", "quit", "пока"):
         session.save()
         return ["Закрыто. Пока!"]
-    for head in ("мощность ", "мощность", "модель ", "model "):
+    for head in ("мощность ", "мощность", "модель ", "model ", "provider ", "провайдер ", "мышление ", "thinking "):
         if low.startswith(head) and len(low) > len(head):
-            return set_power(session, text[len(head):])
+            token = text[len(head):].strip()
+            if head.strip() in ("мощность", "модель", "model"):
+                return set_power(session, token)
+            if head.strip() in ("provider", "провайдер"):
+                return set_provider(session, token)
+            return set_variant(session, token)
     if low == "мощность" or low == "model":
         return set_power(session, "")
-    smart = smart_intent(session, text)
+    if low in ("provider", "провайдер"):
+        return set_provider(session, "")
+    if low in ("мышление", "thinking"):
+        return set_variant(session, "")
+    smart, notes = smart_intent(session, text)
     if smart and smart.get("intent") == "chat":
         reply = (smart.get("reply") or "").strip()
-        return [reply or "Я готов выполнить команду платформы."] + [
-            "(мозг: " + ("LLM " + session.model_label() if session.model or not session.llm_broken else "встроенный парсер") + ")"
-        ]
-    cmd = smart if smart else parse(text)
-    if cmd:
-        cmd = {**cmd, "kind": cmd.get("intent", "") if cmd.get("intent") else cmd.get("kind", "")}
-        cmd = {k: v for k, v in cmd.items() if k != "intent"}
-        if cmd.get("kind") == "" or (cmd.get("kind") == "chat"):
-            cmd = parse(text)
+        return [reply or "Я готов выполнить команду платформы."] + notes
+    if not smart:
+        cmd = parse(text)
+    else:
+        cmd = {**smart, "kind": smart.get("intent", "")}
+        cmd.pop("intent", None)
+        if cmd.get("kind") in ("user", "project", "change", "run") and not cmd.get("rest"):
+            cmd["rest"] = smart.get("name") or smart.get("title") or smart.get("task") or ""
     if not cmd or not cmd.get("kind"):
-        return ["Не понял фразы."] + HELP
+        return ["Не понял фразы."] + notes[:1] + HELP
     kind = cmd["kind"]
     if kind == "help":
         return HELP
+    if kind == "chat":
+        return [(smart.get("reply") or "Я готов выполнить команду платформы.")] if smart else ["Не понял."] + HELP
+    out: list[str]
     if kind == "user":
         uid = ensure_user(session, api, cmd.get("rest") or "user")
-        return [_ok(f"пользователь {session.uname} -> {uid}")]
-    if kind == "project":
-        return flow_project(session, api, cmd.get("rest") or "proj")
-    if kind == "change":
-        return flow_change(session, api, cmd.get("rest") or "")
-    if kind == "run":
-        return flow_run(session, api, cmd.get("rest") or None)
-    if kind == "merge":
-        return flow_merge(session, api)
-    if kind == "status":
-        return flow_status(session, api)
-    if kind == "analytics":
-        return flow_analytics(session, api)
-    if kind == "demo":
+        out = [_ok(f"пользователь {session.uname} -> {uid}")]
+    elif kind == "project":
+        out = flow_project(session, api, cmd.get("rest") or "proj")
+    elif kind == "change":
+        out = flow_change(session, api, cmd.get("rest") or "")
+    elif kind == "run":
+        out = flow_run(session, api, cmd.get("rest") or None)
+    elif kind == "merge":
+        out = flow_merge(session, api)
+    elif kind == "status":
+        out = flow_status(session, api)
+    elif kind == "analytics":
+        out = flow_analytics(session, api)
+    elif kind == "demo":
         flow_demo(session, api)
-        return []
-    return ["Не понял."]
+        out = []
+    else:
+        out = ["Не понял."]
+    return out + notes
 
 
 def repl() -> int:
@@ -570,12 +732,12 @@ def repl() -> int:
             print("[!] не удалось поднять сервер; запусти 'aip serve' вручную")
             return 1
     session = Session.load()
-    print("aip chat — говори по-русски: 'помощь' — список, 'мощность' — выбор модели, 'выход' — завершить.")
+    print("aip chat — говори по-русски: 'помощь' — список, 'мощность/провайдер/мышление' — модель, 'выход' — завершить.")
     if session.llm_broken:
-        print("  (LLM недоступен для ключей этой машины — работаю встроенным родителем; 'мощность low' попробует свободную модель afresh)")
+        print("  (LLM не ответила в прошлый раз — при новой реплике попробую заново)")
         session.llm_broken = False
         session.save()
-    print(f"  мощность: {session.power} ({session.model_label()})")
+    print(f"  модель: {session.model_label()}")
     if session.uname:
         print(f"  (сессия: {session.uname}; проект: {session.current_project or '-'})")
     while True:

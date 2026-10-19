@@ -20,6 +20,53 @@ import httpx
 
 DEFAULT_URL = os.environ.get("AIPLATFORM_URL", "http://127.0.0.1:7700")
 SESSION_FILE = os.path.join(os.getcwd(), ".aip-session.json")
+OPENCODE_URL = os.environ.get("AIPLATFORM_OPENCODE_URL", "http://127.0.0.1:4096")
+
+MODEL_PRESETS: dict[str, tuple[str, str]] = {
+    "low": ("opencode", "glm-5.3-flash-free"),
+    "medium": ("anthropic", "claude-haiku-4-5"),
+    "high": ("anthropic", "claude-sonnet-4-5"),
+    "max": ("anthropic", "claude-opus-4-5"),
+}
+
+LLM_DIRECTIVE = (
+    "Ты мозг CLI-агента платформы. Отвечай ОДНОЙ строкой строгого JSON без markdown:\n"
+    '{"intent":"user|project|change|run|merge|status|analytics|demo|help|chat",'
+    '"name":"","title":"","task":"","reply":""}\n'
+    "Поле reply — только для intent=chat: твой живой русский ответ пользователю.\n"
+    "правила: empty поля — empty строки; не добавляй ничего кроме JSON."
+)
+
+
+def _oc_request(method: str, path: str, body: dict | None = None, timeout: float = 240.0) -> dict:
+    auth = (
+        os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"),
+        os.environ.get("OPENCODE_SERVER_PASSWORD", "opencode"),
+    )
+    r = httpx.request(method, OPENCODE_URL + path, json=body, auth=auth, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{path} -> {r.status_code}")
+    return r.json()
+
+
+def llm_call(provider_id: str, model_id: str, text: str) -> str:
+    data = _oc_request("POST", "/session", {"title": "aip-chat"})
+    sid = data["id"]
+    msg = _oc_request(
+        "POST",
+        f"/session/{sid}/message",
+        {"modelID": model_id, "providerID": provider_id, "parts": [{"type": "text", "text": text}]},
+    )
+    info = (msg or {}).get("info") or {}
+    err = info.get("error")
+    if err:
+        raise RuntimeError(f"model error: {str(err.get('data', {}).get('message', err))[:120]}")
+    texts = [
+        p.get("text", "")
+        for p in (msg.get("parts") or [])
+        if isinstance(p, dict) and p.get("type") == "text"
+    ]
+    return "\n".join(t for t in texts if t).strip()
 
 
 def _typical_answer(project_name: str) -> str:
@@ -57,6 +104,9 @@ class Session:
         self.current_project: str = ""
         self.current_change: str = ""
         self.pending: dict | None = None
+        self.power: str = "max"
+        self.model: str = ""
+        self.llm_broken: bool = False
 
     def save(self) -> None:
         try:
@@ -68,6 +118,9 @@ class Session:
                         "projects": self.projects,
                         "current_project": self.current_project,
                         "current_change": self.current_change,
+                        "power": self.power,
+                        "model": self.model,
+                        "llm_broken": self.llm_broken,
                     },
                     fh,
                     ensure_ascii=False,
@@ -86,9 +139,18 @@ class Session:
             s.projects = data.get("projects", {})
             s.current_project = data.get("current_project", "")
             s.current_change = data.get("current_change", "")
+            s.power = data.get("power", "max")
+            s.model = data.get("model", "")
+            s.llm_broken = bool(data.get("llm_broken"))
         except (OSError, ValueError):
             pass
         return s
+
+    def model_label(self) -> str:
+        if self.model:
+            return self.model
+        provider, model = MODEL_PRESETS.get(self.power, MODEL_PRESETS["max"])
+        return f"{provider}/{model}"
 
 
 def _ok(msg: str) -> str:
@@ -106,9 +168,13 @@ def _warn(msg: str) -> str:
 def ensure_user(session: Session, api: Api, name: str) -> str:
     if session.uname == name and session.uid:
         return session.uid
-    data = api.call("POST", "/v1/users", body={"name": name})
+    try:
+        data = api.call("POST", "/v1/users", body={"name": name})
+    except RuntimeError:
+        suffix = abs(hash((name, session.uid))) % 10000
+        data = api.call("POST", "/v1/users", body={"name": f"{name}-{suffix}"})
     session.uid = data["id"]
-    session.uname = name
+    session.uname = data.get("name") or name
     session.save()
     return session.uid
 
@@ -368,6 +434,72 @@ def parse(text: str) -> dict:
     return {}
 
 
+INTENT_KEYS = ("user", "project", "change", "run", "merge", "status", "analytics", "demo", "help", "chat")
+
+
+def smart_intent(session: Session, text: str) -> dict | None:
+    """LLM-компас: превращает свободную фразу в {intent, ...}.
+
+    При недоступности/ошибке модели возвращает None и сеанс переключается
+    на встроенный детерминированный парсер.
+    """
+    if session.llm_broken:
+        return None
+    if session.model and "/" in session.model:
+        provider_id, model_id = session.model.split("/", 1)
+    else:
+        provider_id, model_id = MODEL_PRESETS.get(session.power, MODEL_PRESETS["max"])
+    try:
+        raw = llm_call(provider_id, model_id, f"{LLM_DIRECTIVE}\n\nПользователь написал: {text}")
+    except Exception:
+        session.llm_broken = True
+        session.save()
+        return None
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        session.llm_broken = True
+        session.save()
+        return None
+    try:
+        data = json.loads(raw[start : end + 1])
+    except ValueError:
+        session.llm_broken = True
+        session.save()
+        return None
+    if not isinstance(data, dict) or data.get("intent") not in INTENT_KEYS:
+        session.llm_broken = True
+        session.save()
+        return None
+    return data
+
+
+def set_power(session: Session, token: str) -> list[str]:
+    token = token.strip().lower()
+    if not token:
+        return [f"Сейчас: {session.power} (= {session.model_label()})", "Варианты: низкая | средняя | высокая | максимальная | режим provider/model"]
+    low = token[0]
+    aliases = {
+        "л": "low", "с": "medium", "в": "high", "м": "max",
+        "low": "low", "medium": "medium", "high": "high", "max": "max",
+    }
+    if token in aliases:
+        session.power = aliases[token]
+        session.model = ""
+        session.save()
+        return [_ok(f"мощность: {session.power} (= {session.model_label()})")]
+    if low in aliases:
+        session.power = aliases[low]
+        session.model = ""
+        session.save()
+        return [_ok(f"мощность: {session.power} (= {session.model_label()})")]
+    if "/" in token:
+            session.model = token
+            session.save()
+            return [_ok(f"модель: {session.model}")]
+    return ["Не понял мощность. Варианты: низкая/средняя/высокая/максимальная или provider/model"]
+
+
 def handle(session: Session, api: Api, text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -376,7 +508,23 @@ def handle(session: Session, api: Api, text: str) -> list[str]:
     if low in ("выход", "exit", "quit", "пока"):
         session.save()
         return ["Закрыто. Пока!"]
-    cmd = parse(text)
+    for head in ("мощность ", "мощность", "модель ", "model "):
+        if low.startswith(head) and len(low) > len(head):
+            return set_power(session, text[len(head):])
+    if low == "мощность" or low == "model":
+        return set_power(session, "")
+    smart = smart_intent(session, text)
+    if smart and smart.get("intent") == "chat":
+        reply = (smart.get("reply") or "").strip()
+        return [reply or "Я готов выполнить команду платформы."] + [
+            "(мозг: " + ("LLM " + session.model_label() if session.model or not session.llm_broken else "встроенный парсер") + ")"
+        ]
+    cmd = smart if smart else parse(text)
+    if cmd:
+        cmd = {**cmd, "kind": cmd.get("intent", "") if cmd.get("intent") else cmd.get("kind", "")}
+        cmd = {k: v for k, v in cmd.items() if k != "intent"}
+        if cmd.get("kind") == "" or (cmd.get("kind") == "chat"):
+            cmd = parse(text)
     if not cmd or not cmd.get("kind"):
         return ["Не понял фразы."] + HELP
     kind = cmd["kind"]
@@ -422,7 +570,12 @@ def repl() -> int:
             print("[!] не удалось поднять сервер; запусти 'aip serve' вручную")
             return 1
     session = Session.load()
-    print("aip chat — говори по-русски: 'помощь' — список, 'выход' — завершить.")
+    print("aip chat — говори по-русски: 'помощь' — список, 'мощность' — выбор модели, 'выход' — завершить.")
+    if session.llm_broken:
+        print("  (LLM недоступен для ключей этой машины — работаю встроенным родителем; 'мощность low' попробует свободную модель afresh)")
+        session.llm_broken = False
+        session.save()
+    print(f"  мощность: {session.power} ({session.model_label()})")
     if session.uname:
         print(f"  (сессия: {session.uname}; проект: {session.current_project or '-'})")
     while True:

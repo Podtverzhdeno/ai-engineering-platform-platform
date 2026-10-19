@@ -66,6 +66,29 @@ def test_free_provider_choice(agent_api, monkeypatch):
     assert any("glm-5.3-flash-free, размышление: low" in x for x in out)
 
 
+def test_stale_context_heals(agent_api):
+    s = Session()
+    s.uid = "usr-deadbeefdead"
+    s.uname = "owner"
+    s.projects = {}
+    s.current_project = "PRJ-ghost"
+    s.current_change = ""
+    s.save()
+    out = handle(s, agent_api, "создай change каталог цен")
+    assert any("сессия с другого сервера" in x for x in out)
+    assert s.uid.startswith("usr-") and s.uid != "usr-deadbeefdead"
+    assert s.current_project.startswith("PRJ-")
+    assert s.current_change.startswith("CHG-")
+
+
+def test_run_without_change_autocreates_chain(agent_api):
+    s = Session()
+    out = handle(s, agent_api, "запусти задачу")
+    assert any("нет change" in x for x in out)
+    assert s.current_change.startswith("CHG-")
+    assert s.current_project.startswith("PRJ-")
+
+
 def _reply(api, user, path, body=None):
     r = api.client.request("POST", "http://testserver" + path, json=body, headers={"X-User-Id": user} if user else {})
     assert r.status_code < 500

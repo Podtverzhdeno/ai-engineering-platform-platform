@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -142,6 +143,25 @@ class Api:
         except (httpx.HTTPError, OSError):
             return False
 
+    def user_ok(self, uid: str) -> bool:
+        """Живёт ли uid на ЭТОМ сервере (защита от сессии другой базы)."""
+        if not uid:
+            return False
+        try:
+            self.call("GET", "/v1/projects", uid=uid)
+        except RuntimeError:
+            return False
+        return True
+
+    def project_ok(self, session: "Session", pid: str) -> bool:
+        if not pid:
+            return False
+        try:
+            self.call("GET", f"/v1/projects/{pid}", uid=session.uid or "")
+        except RuntimeError:
+            return False
+        return True
+
 
 class Session:
     def __init__(self) -> None:
@@ -219,18 +239,32 @@ def _warn(msg: str) -> str:
     return f"  [!] {msg}"
 
 
-def ensure_user(session: Session, api: Api, name: str) -> str:
+def ensure_user(session: Session, api: Api, name: str, narrate: list[str] | None = None) -> str:
+    if session.uid and not api.user_ok(session.uid):
+        if narrate is not None:
+            narrate.append(_prog("сессия с другого сервера — создаю пользователя заново"))
+        session.uid = ""
+        session.uname = ""
+        session.projects = {}
+        session.current_project = ""
+        session.current_change = ""
+        session.save()
     if session.uname == name and session.uid:
         return session.uid
     try:
         data = api.call("POST", "/v1/users", body={"name": name})
     except RuntimeError:
-        suffix = abs(hash((name, session.uid))) % 10000
+        suffix = abs(hash((name,))) % 10000
         data = api.call("POST", "/v1/users", body={"name": f"{name}-{suffix}"})
     session.uid = data["id"]
     session.uname = data.get("name") or name
     session.save()
     return session.uid
+
+
+def _project_slug(hint: str) -> str:
+    m = re.search(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", hint or "")
+    return m.group(0).lower() if m else "proj"
 
 
 def _interview_autopilot(session: Session, api: Api, itw: str, pid: str, name: str) -> list[str]:
@@ -290,10 +324,17 @@ def flow_project(session: Session, api: Api, name: str) -> list[str]:
 
 
 def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
-    if not session.current_project:
-        return ["Нет текущего проекта — сначала 'создай проект <имя>'."]
+    out: list[str] = []
+    uid = ensure_user(session, api, "owner", narrate=out)
     pid = session.current_project
-    uid = ensure_user(session, api, "owner")
+    if pid and not api.project_ok(session, pid):
+        out.append(_prog("проект из прошлой сессии не найден на этом сервере — создаю заново"))
+        pid = ""
+        session.current_project = ""
+        session.save()
+    if not pid:
+        out += flow_project(session, api, _project_slug(title_hint) or "proj")
+        pid = session.current_project
     title = title_hint or "chat change"
     files = ["docs/readme.md"]
     cid = api.call("POST", "/v1/changes", uid=uid, body={
@@ -317,7 +358,7 @@ def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
     )
     session.current_change = cid
     session.save()
-    return [
+    return out + [
         _ok(f"change: {cid} (title={title})"),
         _ok("delta + design + approval + plan: 1 задача (scope=docs/readme.md)"),
         "Теперь 'запусти задачу' — runner выполнит T1, затем 'мёрж'.",
@@ -325,9 +366,16 @@ def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
 
 
 def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
+    out: list[str] = []
+    uid = ensure_user(session, api, "owner", narrate=out)
+    if session.current_change and not api.project_ok(session, session.current_project):
+        out.append(_prog("контекст из прошлой сессии не найден — пересоздаю"))
+        session.current_project = ""
+        session.current_change = ""
+        session.save()
     if not session.current_change:
-        return [ "Нет текущего change — сначала 'создай change'."]
-    uid = ensure_user(session, api, "owner")
+        out.append(_prog("нет change — создаю типовой change 'task'"))
+        out += [line for line in flow_change(session, api, "task") if not line.startswith("Теперь")]
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     runner = os.path.join(repo_root, "infra", "runner", "runner.py")
     cmd = [
@@ -344,7 +392,7 @@ def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
     ]
     if task:
         cmd += ["--task", task]
-    out = [_prog(f"runner запущен (change {session.current_change[:12]}...)")]
+    out.append(_prog(f"runner запущен (change {session.current_change[:12]}...)"))
     try:
         proc = subprocess.Popen(
             cmd,
@@ -368,9 +416,16 @@ def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
 
 
 def flow_merge(session: Session, api: Api) -> list[str]:
+    out: list[str] = []
+    uid = ensure_user(session, api, "owner", narrate=out)
+    if session.current_change and not api.project_ok(session, session.current_project):
+        out.append(_prog("контекст из прошлой сессии не найден — пересоздаю"))
+        session.current_project = ""
+        session.current_change = ""
+        session.save()
     if not session.current_change:
-        return ["Нет текущего change."]
-    uid = ensure_user(session, api, "owner")
+        out.append(_prog("нет change — создаю типовой change 'task'"))
+        out += [line for line in flow_change(session, api, "task") if not line.startswith("Теперь")]
     cid = session.current_change
     api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "unit", "status": "PASS"})
     api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "regression", "status": "PASS"})
@@ -402,6 +457,8 @@ def flow_analytics(session: Session, api: Api) -> list[str]:
     if not session.current_project:
         return ["Нет текущего проекта."]
     uid = ensure_user(session, api, "owner")
+    if not api.project_ok(session, session.current_project):
+        return [_warn("проект прошлой сессии не найден на этом сервере — начни с 'создай проект'")]
     a = api.call("GET", f"/v1/analytics/{session.current_project}", uid=uid)
     m = api.call("GET", f"/v1/memory/{session.current_project}", uid=uid)
     out = [_prog("аналитика")]

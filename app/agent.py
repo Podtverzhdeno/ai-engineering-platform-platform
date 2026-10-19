@@ -52,17 +52,34 @@ LLM_DIRECTIVE = (
 )
 
 _VARIANTS_CACHE: dict[str, dict[str, list[str]]] | None = None
+_OC_AUTH_OK: tuple[str, str] | None = None
 
 
 def _oc_request(method: str, path: str, body: dict | None = None, timeout: float = 240.0) -> dict:
-    auth = (
-        os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"),
-        os.environ.get("OPENCODE_SERVER_PASSWORD", "opencode"),
-    )
-    r = httpx.request(method, OPENCODE_URL + path, json=body, auth=auth, timeout=timeout)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{path} -> {r.status_code}")
-    return r.json()
+    global _OC_AUTH_OK
+    env_user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+    env_pass = os.environ.get("OPENCODE_SERVER_PASSWORD", "opencode")
+    known: list[tuple[str, str] | None] = [_OC_AUTH_OK] if _OC_AUTH_OK is not None else []
+    candidates = known + [None, (env_user, env_pass)]
+    tried: set = set()
+    auth_errors: list[str] = []
+    for auth in candidates:
+        if auth in tried:
+            continue
+        tried.add(auth)
+        try:
+            r = httpx.request(method, OPENCODE_URL + path, json=body, auth=auth, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"{path} -> связь с opencode потеряна ({exc.__class__.__name__})") from exc
+        if r.status_code == 401:
+            label = "без ключа" if auth is None else f"ключ {auth[0]}/…"
+            auth_errors.append(label)
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"{path} -> {r.status_code}")
+        _OC_AUTH_OK = auth
+        return r.json()
+    raise RuntimeError(f"{path} -> 401 ({', '.join(auth_errors) or 'нет подходящего ключа'})")
 
 
 def provider_variants() -> dict[str, dict[str, list[str]]]:
@@ -184,6 +201,7 @@ class Session:
         self.model: str = ""
         self.variant: str = ""
         self.oc_sid: str = ""
+        self.open_changes: dict[str, list[str]] = {}
         self.llm_broken: bool = False
 
     def save(self) -> None:
@@ -199,6 +217,7 @@ class Session:
                         "power": self.power,
                         "model": self.model,
                         "variant": self.variant,
+                        "open_changes": self.open_changes,
                         "llm_broken": self.llm_broken,
                     },
                     fh,
@@ -221,6 +240,7 @@ class Session:
             s.power = data.get("power", "max")
             s.model = data.get("model", "")
             s.variant = data.get("variant", "")
+            s.open_changes = {k: list(v) for k, v in (data.get("open_changes") or {}).items()}
             s.llm_broken = bool(data.get("llm_broken"))
         except (OSError, ValueError):
             pass
@@ -343,6 +363,16 @@ def flow_project(session: Session, api: Api, name: str) -> list[str]:
     return out + _interview_autopilot(session, api, itw, pid, name)
 
 
+def _project_state(session: Session, api: Api, pid: str) -> str:
+    if not pid:
+        return ""
+    try:
+        data = api.call("GET", f"/v1/projects/{pid}", uid=session.uid or "")
+        return (data or {}).get("state", "")
+    except RuntimeError:
+        return ""
+
+
 def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
     out: list[str] = []
     uid = ensure_user(session, api, "owner", narrate=out)
@@ -355,7 +385,31 @@ def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
     if not pid:
         out += flow_project(session, api, _project_slug(title_hint) or "proj")
         pid = session.current_project
+    state = _project_state(session, api, pid)
+    if state == "DESIGNING" and session.current_change:
+        try:
+            api.call(
+                "POST",
+                "/v1/approvals",
+                uid=uid,
+                body={"project_id": pid, "purpose": "design", "change_id": session.current_change},
+            )
+        except RuntimeError as exc:
+            if _change_state(session, api, session.current_change) == "MERGED":
+                raise RuntimeError(
+                    "проект застрял на согласовании дизайна, а его change уже смёржен (старая логика сервера); "
+                    "начни свежий проект фразой 'создай проект <название>'"
+                ) from exc
+            raise
+        state = _project_state(session, api, pid)
+        out.append(_ok(f"change {session.current_change} ждал согласования дизайна — утвердил"))
+    if state not in ("PRODUCT_APPROVED", "DESIGN_APPROVED"):
+        raise RuntimeError(
+            f"проект {pid} сейчас в состоянии {state or 'неизвестном'} — незакрытый change мешает новому; "
+            "скажи 'запусти задачу', а потом 'мёрж'"
+        )
     title = title_hint or "chat change"
+    _finish_open_changes(session, api, uid, pid, out, include_current=True)
     files = ["docs/readme.md"]
     cid = api.call("POST", "/v1/changes", uid=uid, body={
         "project_id": pid, "title": title, "affected_paths": files,
@@ -377,6 +431,9 @@ def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
         body={"tasks": [{"key": "T1", "write_scope": files, "depends_on": [], "acceptance_ids": ["REQ-1-SC1"]}]},
     )
     session.current_change = cid
+    session.open_changes.setdefault(pid, [])
+    if cid not in session.open_changes[pid]:
+        session.open_changes[pid].append(cid)
     session.save()
     return out + [
         _ok(f"change: {cid} (title={title})"),
@@ -385,19 +442,20 @@ def flow_change(session: Session, api: Api, title_hint: str) -> list[str]:
     ]
 
 
-def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
-    out: list[str] = []
-    uid = ensure_user(session, api, "owner", narrate=out)
-    if session.current_change and not api.project_ok(session, session.current_project):
-        out.append(_prog("контекст из прошлой сессии не найден — пересоздаю"))
-        session.current_project = ""
-        session.current_change = ""
-        session.save()
-    if not session.current_change:
-        out.append(_prog("нет change — создаю типовой change 'task'"))
-        out += [line for line in flow_change(session, api, "task") if not line.startswith("Теперь")]
+def _change_state(session: Session, api: Api, cid: str) -> str:
+    if not cid:
+        return ""
+    try:
+        data = api.call("GET", f"/v1/changes/{cid}", uid=session.uid or "")
+        return (data or {}).get("state", "")
+    except RuntimeError:
+        return ""
+
+
+def _runner_attempt(session: Session, api: Api, uid: str, cid: str, task: str | None) -> tuple[list[str], int, str]:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     runner = os.path.join(repo_root, "infra", "runner", "runner.py")
+    ws_root = os.path.join(repo_root, ".workspaces")
     cmd = [
         sys.executable,
         runner,
@@ -406,13 +464,15 @@ def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
         "--uid",
         uid,
         "--change",
-        session.current_change,
+        cid,
+        "--workspace-root",
+        ws_root,
         "--seed-note",
         "chat-agent artifact",
     ]
     if task:
         cmd += ["--task", task]
-    out.append(_prog(f"runner запущен (change {session.current_change[:12]}...)"))
+    lines: list[str] = []
     try:
         proc = subprocess.Popen(
             cmd,
@@ -424,14 +484,96 @@ def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
             cwd=repo_root,
         )
         for line in proc.stdout or []:
-            out.append(f"    {line.rstrip()}")
+            lines.append(line.rstrip())
         rc = proc.wait(timeout=900)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [ _warn(f"runner не запустился: {exc}") ]
+        return [f"runner не запустился: {exc}"], 1, ""
+    run_id = ""
+    for ln in lines:
+        if ln.startswith("claim: task="):
+            _, _, tail = ln.partition(" run=")
+            run_id = tail.strip() or run_id
+    if rc != 0 and run_id:
+        try:
+            api.call("POST", f"/v1/runs/{run_id}/cancel", uid=uid)
+            lines.append(_prog(f"зависший run {run_id} отменён — задача снова READY"))
+        except RuntimeError:
+            pass
+    return lines, rc, run_id
+
+
+def _merge_change(session: Session, api: Api, uid: str, cid: str) -> list[str]:
+    api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "unit", "status": "PASS"})
+    api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "regression", "status": "PASS"})
+    ready = api.call("GET", f"/v1/changes/{cid}/readiness", uid=uid)
+    out = [_prog("test-results PASS"), _ok(f"readiness={ready['verdict']} gaps={ready['gaps']}")]
+    if ready["verdict"] != "GO":
+        out.append(_warn("readiness не GO — мёрж заблокирован"))
+        return out
+    mrg = api.call("POST", f"/v1/changes/{cid}/merge", uid=uid)
+    out.append(_ok(f"merge: {mrg.get('state')}"))
+    return out
+
+
+def _finish_open_changes(session: Session, api: Api, uid: str, pid: str, out: list[str], include_current: bool = False) -> None:
+    for cid in list(session.open_changes.get(pid or "") or []):
+        if not include_current and cid == session.current_change:
+            continue
+        if _change_state(session, api, cid) == "MERGED":
+            continue
+        out.append(_prog(f"незакрытый change {cid[:12]}... в очереди — собираю его (runner + мёрж)"))
+        keep = session.current_change
+        session.current_change = cid
+        lines, rc, _ = _runner_attempt(session, api, uid, cid, None)
+        session.current_change = keep
+        for ln in lines:
+            out.append(f"    {ln}")
+        if rc == 0:
+            try:
+                out += _merge_change(session, api, uid, cid)
+            except RuntimeError as exc:
+                out.append(_warn(str(exc)[:160]))
+        else:
+            out.append(_warn(f"change {cid} не собрался — оставляю в очереди"))
+
+
+def flow_run(session: Session, api: Api, task: str | None) -> list[str]:
+    out: list[str] = []
+    uid = ensure_user(session, api, "owner", narrate=out)
+    if session.current_change and not api.project_ok(session, session.current_project):
+        out.append(_prog("контекст из прошлой сессии не найден — пересоздаю"))
+        session.current_project = ""
+        session.current_change = ""
+        session.save()
+    if session.current_change and _change_state(session, api, session.current_change) == "MERGED":
+        out.append(_prog("последний change уже смёржен — открываю новый change 'task'"))
+        session.current_change = ""
+        session.save()
+    if not session.current_change:
+        out.append(_prog("нет change — создаю типовой change 'task'"))
+        out += [line for line in flow_change(session, api, "task") if not line.startswith("Теперь")]
+    out.append(_prog(f"runner запущен (change {session.current_change[:12]}...)"))
+    if task:
+        try:
+            titles = [t["title"] for t in api.call("GET", f"/v1/changes/{session.current_change}/tasks", uid=uid)]
+        except RuntimeError:
+            titles = []
+        if task not in titles:
+            task = None
+    lines, rc, _ = _runner_attempt(session, api, uid, session.current_change, task)
+    for ln in lines:
+        out.append(f"    {ln}")
+    if rc != 0 and any("WRITE_SCOPE_CONFLICT" in ln for ln in lines):
+        _finish_open_changes(session, api, uid, session.current_project, out)
+        out.append(_prog("перезапускаю исходную задачу"))
+        lines, rc, _ = _runner_attempt(session, api, uid, session.current_change, None)
+        for ln in lines:
+            out.append(f"    {ln}")
     if rc != 0:
-        out.append(_warn(f"runner завершился с кодом {rc}"))
+        out.append(_warn(f"runner завершился с кодом {rc} — попробуй 'запусти задачу' ещё раз"))
     else:
         out.append(_ok("задача DONE"))
+    session.save()
     return out
 
 
@@ -446,16 +588,10 @@ def flow_merge(session: Session, api: Api) -> list[str]:
     if not session.current_change:
         out.append(_prog("нет change — создаю типовой change 'task'"))
         out += [line for line in flow_change(session, api, "task") if not line.startswith("Теперь")]
-    cid = session.current_change
-    api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "unit", "status": "PASS"})
-    api.call("POST", f"/v1/changes/{cid}/test-results", uid=uid, body={"suite": "regression", "status": "PASS"})
-    ready = api.call("GET", f"/v1/changes/{cid}/readiness", uid=uid)
-    out = [_prog("test-results PASS"), _ok(f"readiness={ready['verdict']} gaps={ready['gaps']}")]
-    if ready["verdict"] != "GO":
-        out.append(_warn("readiness не GO — мёрж заблокирован"))
-        return out
-    mrg = api.call("POST", f"/v1/changes/{cid}/merge", uid=uid)
-    out.append(_ok(f"merge: {mrg.get('state')}"))
+    try:
+        out += _merge_change(session, api, uid, session.current_change)
+    except RuntimeError as exc:
+        out.append(_warn(str(exc)[:200]))
     return out
 
 
@@ -790,27 +926,33 @@ def handle(session: Session, api: Api, text: str) -> list[str]:
         return HELP
     if kind == "chat":
         return [(smart.get("reply") or "Я готов выполнить команду платформы.")] if smart else ["Не понял."] + HELP
-    out: list[str]
-    if kind == "user":
-        uid = ensure_user(session, api, cmd.get("rest") or "user")
-        out = [_ok(f"пользователь {session.uname} -> {uid}")]
-    elif kind == "project":
-        out = flow_project(session, api, cmd.get("rest") or "proj")
-    elif kind == "change":
-        out = flow_change(session, api, cmd.get("rest") or "")
-    elif kind == "run":
-        out = flow_run(session, api, cmd.get("rest") or None)
-    elif kind == "merge":
-        out = flow_merge(session, api)
-    elif kind == "status":
-        out = flow_status(session, api)
-    elif kind == "analytics":
-        out = flow_analytics(session, api)
-    elif kind == "demo":
-        flow_demo(session, api)
-        out = []
-    else:
-        out = ["Не понял."]
+    out: list[str] = []
+    try:
+        if kind == "user":
+            uid = ensure_user(session, api, cmd.get("rest") or "user")
+            out = [_ok(f"пользователь {session.uname} -> {uid}")]
+        elif kind == "project":
+            out = flow_project(session, api, cmd.get("rest") or "proj")
+        elif kind == "change":
+            out = flow_change(session, api, cmd.get("rest") or "")
+        elif kind == "run":
+            out = flow_run(session, api, cmd.get("rest") or None)
+        elif kind == "merge":
+            out = flow_merge(session, api)
+        elif kind == "status":
+            out = flow_status(session, api)
+        elif kind == "analytics":
+            out = flow_analytics(session, api)
+        elif kind == "demo":
+            flow_demo(session, api)
+            out = []
+        else:
+            out = ["Не понял."]
+    except RuntimeError as exc:
+        out = [
+            "[!] не вышло: " + str(exc)[:220],
+            "Скажи 'статус' — покажу, где мы; продолжай другой фразой.",
+        ]
     return out + notes
 
 

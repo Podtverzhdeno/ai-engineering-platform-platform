@@ -62,6 +62,7 @@ def _apply_committed_effect(db: Session, approval: Approval, project: Project) -
         change.state = "DESIGN_APPROVED"
         if project.state == "PRODUCT_APPROVED":
             state_machine.transition(db, project, "DESIGN_PROPOSED")
+        if project.state == "DESIGNING":
             state_machine.transition(db, project, "DESIGN_APPROVED")
         db.flush()
         audit.append(db, project.id, approval.actor_id, "design.approved", {"change_id": change.id})

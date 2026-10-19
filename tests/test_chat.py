@@ -118,6 +118,30 @@ def _reply(api, user, path, body=None):
     assert r.status_code < 500
 
 
+def test_second_change_on_same_project(agent_api):
+    s = Session()
+    handle(s, agent_api, "создай change каталог")
+    first = s.current_change
+    out = handle(s, agent_api, "создай change цены и скидки")
+    assert s.current_change.startswith("CHG-") and s.current_change != first
+    assert not any(m.startswith("[!]") for m in out)
+
+
+def test_handle_catches_runtime_errors(agent_api, monkeypatch):
+    s = Session()
+    orig_call = agent_api.call
+
+    def call(method, path, uid="", body=None):
+        if method == "POST" and path == "/v1/changes":
+            raise RuntimeError("POST /v1/changes -> 403 PRODUCT_BLOCKED")
+        return orig_call(method, path, uid=uid, body=body)
+
+    monkeypatch.setattr(agent_api, "call", call)
+    out = handle(s, agent_api, "создай change каталог")
+    assert out[0].startswith("[!] не вышло")
+    assert any("статус" in m for m in out)
+
+
 def test_chat_help_and_unknown(agent_api):
     s = Session()
     out = handle(s, agent_api, "помощь")

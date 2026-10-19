@@ -142,7 +142,7 @@ def propose_design(
     change = _change(db, change_id)
     project = _project(db, change.project_id)
     require_member(db, project, user.id, min_role="owner")
-    if project.state != "PRODUCT_APPROVED":
+    if project.state not in ("PRODUCT_APPROVED", "DESIGN_APPROVED", "IMPLEMENTATION_ALLOWED"):
         raise HTTPException(status_code=409, detail={"error": "PRODUCT_NOT_APPROVED", "state": project.state})
     missing = [a for a in ("design_md",) if not getattr(payload, a)]
     if missing:

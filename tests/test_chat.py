@@ -89,6 +89,30 @@ def test_run_without_change_autocreates_chain(agent_api):
     assert s.current_project.startswith("PRJ-")
 
 
+def test_imperative_question_executes(agent_api, monkeypatch):
+    monkeypatch.setenv("AIPLATFORM_CHAT_BRAIN", "on")
+
+    def fake(provider_id, model_id, text, variant="", session_id=""):
+        return '{"intent":"chat","reply":"Могу попробовать.","name":"","title":"","task":""}', "s9"
+
+    monkeypatch.setattr(agent_mod, "llm_call", fake)
+    s = Session()
+    out = handle(s, agent_api, "можешь внести фичи для улучшений каталога?")
+    assert s.current_change.startswith("CHG-")
+    assert any("change" in x for x in out)
+
+
+def test_project_reuse(agent_api):
+    s = Session()
+    handle(s, agent_api, "создай проект orders")
+    first = s.current_project
+    out = handle(s, agent_api, "можешь улучшить проект orders?")
+    assert first == s.current_project
+    assert len(s.projects) == 1
+    assert s.current_change.startswith("CHG-")
+    assert any("change" in x for x in out)
+
+
 def _reply(api, user, path, body=None):
     r = api.client.request("POST", "http://testserver" + path, json=body, headers={"X-User-Id": user} if user else {})
     assert r.status_code < 500

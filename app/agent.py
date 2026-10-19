@@ -39,7 +39,16 @@ LLM_DIRECTIVE = (
     '{"intent":"user|project|change|run|merge|status|analytics|demo|help|chat",'
     '"name":"","title":"","task":"","reply":""}\n'
     "Поле reply — только для intent=chat: твой живой русский ответ пользователю.\n"
-    "правила: empty поля — empty строки; не добавляй ничего кроме JSON."
+    "ПРАВИЛА НАМЕРЕНИЙ (важно):\n"
+    "- В вопросе-просьбе с действием ('можешь внести фичи?', 'улучши проект X?',"
+    " 'сделай так чтобы...') выбирай ОПЕРАЦИЮ, а не help:\n"
+    "  внести/улучшить/добавить фич или правки -> change; создать продукт/проект -> project;\n"
+    "  выполнить задачу/запустить -> run; слить/мёрж -> merge; собрать отчёт -> status.\n"
+    "- intent=help ТОЛЬКО когда пользователь просит список команд ('что ты умеешь', 'команды').\n"
+    "- intent=chat — только разговор без действия (приветствие, внешние темы).\n"
+    "- name: короткая латиница-основа из фразы (если есть слово/путь, например из"
+    " 'C:\\\\proj\\\\my-app' -> my-app); title: человекочитаемая цель.\n"
+    "правила: пустые поля — пустые строки; ничего кроме JSON."
 )
 
 _VARIANTS_CACHE: dict[str, dict[str, list[str]]] | None = None
@@ -262,9 +271,13 @@ def ensure_user(session: Session, api: Api, name: str, narrate: list[str] | None
     return session.uid
 
 
+def _latin_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", (text or "").lower())
+
+
 def _project_slug(hint: str) -> str:
-    m = re.search(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", hint or "")
-    return m.group(0).lower() if m else "proj"
+    toks = _latin_tokens(hint)
+    return toks[-1] if toks else "proj"
 
 
 def _interview_autopilot(session: Session, api: Api, itw: str, pid: str, name: str) -> list[str]:
@@ -299,8 +312,15 @@ def _interview_autopilot(session: Session, api: Api, itw: str, pid: str, name: s
 
 
 def flow_project(session: Session, api: Api, name: str) -> list[str]:
-    uid = ensure_user(session, api, "owner")
-    out = [_prog(f"владелец: {uid}")]
+    out: list[str] = []
+    uid = ensure_user(session, api, "owner", narrate=out)
+    out.append(_prog(f"владелец: {uid}"))
+    existing = (session.projects.get(name) or {}).get("pid", "")
+    if existing and api.project_ok(session, existing):
+        session.current_project = existing
+        session.save()
+        out.append(_ok(f"проект {name} уже есть ({existing}) — работаю с ним"))
+        return out + ["Дальше: 'создай change <название>'."]
     data = api.call(
         "POST",
         "/v1/projects",
@@ -503,7 +523,9 @@ def parse(text: str) -> dict:
     t = " " + text.strip().lower() + " "
     if "демо" in t or "demo" in t:
         return {"kind": "demo"}
-    if any(k in t for k in ("помощь", "что ты умеешь", "кто ты", "help", "?")):
+    if any(k in t for k in ("помощь", "что ты умеешь", "кто ты", "help")) or (
+        "?" in t and not _has_action(text.strip())
+    ):
         return {"kind": "help"}
     if "статус" in t or "как дела" in t or "status" in t:
         return {"kind": "status"}
@@ -521,7 +543,7 @@ def parse(text: str) -> dict:
                 break
         result = {"kind": "run", "rest": rest}
         return result
-    if "change" in t or "изменени" in t:
+    if "change" in t or "изменени" in t or ("фич" in t and any(w in t for w in ACTION_WORDS)) or ("улучш" in t and any(w in t for w in ACTION_WORDS)):
         rest = ""
         for tail in ("создай change ", "новый change ", "change "):
             idx = t.find(tail)
@@ -706,6 +728,18 @@ def set_variant(session: "Session", token: str) -> list[str]:
     return [_ok(f"{provider_id}/{model_id}, размышление: {session.variant or '(по умолчанию)'}")]
 
 
+ACTION_WORDS = (
+    "созда", "внеси", "внести", "улучш", "сдела", "сделай", "добав", "запуст",
+    "собер", "помердж", "мёрж", "мерж", "исправ", "почин", "обнов", "провер",
+    "выполни", "сгенер",
+)
+
+
+def _has_action(text: str) -> bool:
+    low = text.lower()
+    return any(w in low for w in ACTION_WORDS)
+
+
 def handle(session: Session, api: Api, text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -729,6 +763,16 @@ def handle(session: Session, api: Api, text: str) -> list[str]:
     if low in ("мышление", "thinking"):
         return set_variant(session, "")
     smart, notes = smart_intent(session, text)
+    if (not smart or smart.get("intent") in ("help", "chat")) and _has_action(text):
+        guessed = parse(text)
+        if guessed and guessed.get("kind") not in ("", "help", None):
+            if notes and notes[0].startswith("(мозг"):
+                notes = notes[1:]
+            smart = smart or {}
+            smart["intent"] = guessed["kind"]
+            smart.setdefault("name", guessed.get("rest") or "")
+            smart.setdefault("title", guessed.get("rest") or "")
+            notes.append("(догадался по контексту фразы)")
     if smart and smart.get("intent") == "chat":
         reply = (smart.get("reply") or "").strip()
         return [reply or "Я готов выполнить команду платформы."] + notes
